@@ -1,0 +1,18 @@
+# Material de estudo pessoal — não faz parte da entrega do portfolio
+/docs/
+
+# build
+target/
+!.mvn/wrapper/maven-wrapper.jar
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.classpath
+.project
+.settings/
+
+# artefatos locais
+*.log
+.env

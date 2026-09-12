@@ -1,0 +1,100 @@
+# ---------------------------------------------------------------------------
+# Toda a configuração de Kafka do projeto. Cada bloco tem um porquê — o
+# comentário acima de cada propriedade explica a escolha e o que ela custa.
+# ---------------------------------------------------------------------------
+server:
+  port: 8090   # 8080 já é usado pela UI do projeto irmão go-kafka
+
+spring:
+  application:
+    name: java-spring-kafka
+
+  kafka:
+    # Lista de contato inicial. O cliente pergunta a metadata a qualquer um
+    # destes e a partir daí fala direto com o líder de cada partição — não é
+    # um proxy, e não precisa listar o cluster inteiro.
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:39092}
+
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      # JacksonJsonSerializer (Jackson 3, pacote tools.jackson) e não
+      # JsonSerializer (Jackson 2): o Boot 4 traz Jackson 3 no classpath.
+      value-serializer: org.springframework.kafka.support.serializer.JacksonJsonSerializer
+      # acks=all: só considera enviado quando todas as réplicas em sincronia
+      # gravaram. Com acks=1 uma queda do líder logo após o ack perde a
+      # mensagem silenciosamente.
+      acks: all
+      retries: 10
+      properties:
+        # Produtor idempotente: o broker deduplica reenvios da mesma sequência,
+        # então um retry de rede não vira mensagem duplicada no log.
+        enable.idempotence: true
+        # Com idempotência ligada, até 5 lotes em voo mantêm a ordem — o broker
+        # reordena pela sequência. Sem idempotência, qualquer valor > 1 pode
+        # gravar fora de ordem em caso de retry.
+        max.in.flight.requests.per.connection: 5
+        # linger dá ao produtor uma janela para juntar mensagens em um lote.
+        # 10ms de latência em troca de muito menos requisições.
+        linger.ms: 10
+        compression.type: snappy
+        # Nome lógico -> classe. O payload viaja com o header __TypeId__ = "order",
+        # não com o nome da classe Java. Assim produtor e consumidor podem estar
+        # em pacotes (ou linguagens) diferentes sem acoplamento.
+        spring.json.type.mapping: order:com.cyro.kafka.order.Order,invoice:com.cyro.kafka.invoice.Invoice
+
+    consumer:
+      # Grupo padrão; cada @KafkaListener declara o seu e sobrescreve este.
+      group-id: default
+      # Só vale para grupo sem offset salvo. earliest = lê o tópico desde o
+      # começo; latest descartaria tudo que já estava lá.
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      # ErrorHandlingDeserializer embrulha o deserializer real. Sem ele, um JSON
+      # malformado estoura *antes* do listener, onde nenhum error handler
+      # alcança, e o container entra em laço infinito na mesma mensagem.
+      value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+      # read_committed: mensagens de transações abortadas ficam invisíveis.
+      # É o que faz o rollback do InvoiceProcessor ter efeito prático.
+      isolation-level: read_committed
+      properties:
+        spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JacksonJsonDeserializer
+        # Sem isso o deserializer recusa desserializar tipos arbitrários — é uma
+        # proteção contra desserialização insegura vinda de payload hostil.
+        spring.json.trusted.packages: com.cyro.kafka
+        spring.json.type.mapping: order:com.cyro.kafka.order.Order,invoice:com.cyro.kafka.invoice.Invoice
+        # Teto de quanto o consumidor pode ficar sem chamar poll() antes de o
+        # grupo considerá-lo morto e rebalancear. O backoff de retry conta aqui.
+        max.poll.interval.ms: 300000
+        max.poll.records: 50
+
+    listener:
+      # RECORD: commita o offset após cada mensagem processada com sucesso.
+      # BATCH (padrão) commita ao fim do lote — mais rápido, porém um crash no
+      # meio reprocessa o lote inteiro.
+      ack-mode: RECORD
+      # 3 threads para 3 partições: o paralelismo máximo de um grupo é o número
+      # de partições. Uma 4ª thread ficaria ociosa.
+      concurrency: 3
+      # Falha no start se um tópico não existir, em vez de ficar em silêncio
+      # esperando uma mensagem que nunca vem por causa de um typo.
+      missing-topics-fatal: true
+      observation-enabled: true
+
+    template:
+      observation-enabled: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, metrics
+  endpoint:
+    health:
+      show-details: always
+
+logging:
+  level:
+    com.cyro.kafka: INFO
+    # Descomente para ver rebalance, commit de offset e atribuição de partição:
+    # org.springframework.kafka.listener: DEBUG
+    # org.apache.kafka.clients.consumer: DEBUG

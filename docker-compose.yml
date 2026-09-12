@@ -1,0 +1,60 @@
+# Kafka em modo KRaft (sem Zookeeper), 1 broker.
+#
+# Portas deslocadas de propósito (39092 em vez de 9092) para conviver com o
+# projeto go-kafka, que já ocupa 9092 e 29092-29094 nesta máquina.
+name: java-spring-kafka
+
+services:
+  kafka:
+    image: apache/kafka:4.0.0
+    ports:
+      - "39092:39092"
+    environment:
+      # --- identidade do nó no quorum KRaft ---
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      # --- listeners ---
+      # Dois mundos falam com o broker e precisam de endereços diferentes:
+      #   INTERNAL -> outros containers, que resolvem o hostname "kafka"
+      #   HOST     -> a JVM rodando na sua máquina, que resolve "localhost"
+      # O cliente pede metadata e passa a usar o endereço ANUNCIADO. Anunciar
+      # errado conecta e depois trava sem erro claro.
+      KAFKA_LISTENERS: INTERNAL://:19092,CONTROLLER://:9093,HOST://:39092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:19092,HOST://localhost:39092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+
+      # --- tópicos internos (RF=1 porque só há 1 broker) ---
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+
+      # Rebalance imediato; sem isso o grupo espera 3s a cada entrada.
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      # Desligado de propósito: com autocriação, um typo no nome do tópico cria
+      # um tópico novo com 1 partição e o bug só aparece sob carga.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:19092 --list || exit 1"]
+      interval: 5s
+      timeout: 20s
+      retries: 20
+      start_period: 10s
+
+  # UI opcional: `docker compose --profile ui up -d`
+  kafka-ui:
+    image: kafbat/kafka-ui:latest
+    profiles: ["ui"]
+    ports:
+      - "8091:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:19092
+      DYNAMIC_CONFIG_ENABLED: "true"
+    depends_on:
+      kafka:
+        condition: service_healthy
