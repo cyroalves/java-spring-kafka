@@ -1,9 +1,9 @@
 # java-spring-kafka
 
-Pipeline de pedidos orientado a eventos com **Spring Boot 4.1** e **Apache Kafka 4**,
-escrito para expor — e explicar — as decisões que normalmente ficam implícitas:
-onde a ordem é garantida, o que acontece quando um consumidor falha, e até onde
-"exactly-once" realmente vai.
+Pipeline de pedidos orientado a eventos com **Spring Boot 4.1**, **Apache Kafka 4**
+e **Postgres**, escrito para expor — e explicar — as decisões que normalmente ficam
+implícitas: onde a ordem é garantida, o que acontece quando um consumidor falha,
+até onde "exactly-once" realmente vai, e o que sobra para o banco resolver.
 
 Não é um "hello world" de `@KafkaListener`. Cada garantia do sistema está
 implementada, demonstrável por um comando, e coberta por teste de integração
@@ -53,6 +53,23 @@ Os dois consumidores leem **o mesmo tópico em grupos diferentes** — cada grup
 recebe todas as mensagens e mantém o próprio offset. É a diferença entre um log
 particionado e uma fila.
 
+Um terceiro e um quarto grupo projetam esses mesmos eventos em tabelas:
+
+```
+  orders.v1 ──── grupo order-store ────▶ OrderStoreListener ───┐
+                                                               │   ┌────────────┐
+                                                               ├──▶│  Postgres  │
+                                                               │   │  orders    │
+invoices.v1 ──── grupo invoice-store ──▶ InvoiceStoreListener ─┘   │  invoices  │
+                                                                   └──────┬─────┘
+                                                                          ▼
+                                                             GET /api/orders/{id}
+                                                             GET /api/customers/{id}
+```
+
+O banco **não é a fonte da verdade** — o log do Kafka é. As tabelas são projeções
+descartáveis: apagar e resetar o offset do grupo reconstrói tudo relendo o tópico.
+
 ---
 
 ## Rodando
@@ -61,10 +78,12 @@ Requisitos: Docker e um JDK 21+ (o `make` detecta qual usar; Spring Boot 4 não
 roda em Java 17 ou anterior).
 
 ```bash
-make up       # sobe o broker Kafka (KRaft, sem Zookeeper) na porta 39092
+make up       # sobe Kafka (KRaft, porta 39092) e Postgres (porta 35432)
 make run      # sobe a aplicação em http://localhost:8090
 make ui       # opcional: UI web do cluster em http://localhost:8091
 ```
+
+A aplicação exige os dois no ar: sem Postgres, o Flyway falha no start.
 
 Com a aplicação no ar, cada alvo demonstra um comportamento:
 
@@ -79,10 +98,14 @@ Com a aplicação no ar, cada alvo demonstra um comportamento:
 | `make lag`      | lag por grupo e partição                                             |
 | `make dlt`      | conteúdo da dead letter queue                                        |
 | `make peek`     | compara `read_committed` e `read_uncommitted` no mesmo tópico        |
+| `make rows`     | o que os consumidores projetaram no Postgres                         |
+| `make orders-api` | os últimos pedidos gravados, pela API de leitura                    |
+| `make customer` | resumo de um cliente: soma aprovada, pedidos e faturas                |
+| `make psql`     | shell SQL no banco                                                   |
 
 ```bash
 make verify   # build completo + testes de integração (Testcontainers)
-make down     # derruba o broker e apaga os dados
+make down     # derruba broker e banco, e apaga os dados dos dois
 ```
 
 ---
@@ -153,6 +176,46 @@ Duas honestidades sobre esse "exactly-once":
    na última tentativa. Efeito colateral que não pode sobreviver a uma falha deve
    ser produzido no fim do método, nunca antes da parte que pode falhar.
 
+   Com o read model isso deixou de ser sutileza de log e virou linha de tabela:
+   `make rollback` escreve 5 faturas no log, 4 ficam invisíveis, **1 chega ao
+   Postgres**. Um teste fixa esse número.
+
+### Read model (Postgres, JPA e Hibernate)
+Dois consumidores adicionais projetam os eventos em `orders` e `invoices`. A
+motivação não é guardar o evento de novo — é responder o que um tópico
+particionado não responde: "este pedido específico", "quanto este cliente tem
+aprovado". Em Kafka isso seria reler a partição a cada pergunta; em SQL é um
+`sum` com índice.
+
+O que sustenta a escolha:
+
+- **Nenhuma configuração torna atômicos o commit do banco e o commit do offset.**
+  São duas transações, e o Kafka não faz two-phase commit com o Postgres. A saída
+  não é evitar a duplicata — é torná-la inofensiva, com `UNIQUE (order_id)` e
+  `UNIQUE (invoice_id)`. O `exists` antes do insert é otimização; **quem garante é
+  a constraint**, e a violação é tratada como "já processado" em vez de erro.
+- **Schema é do Flyway, não do Hibernate.** `ddl-auto: validate` compara e falha
+  se divergir. `update` nunca remove nem renomeia, só acumula, e cada ambiente
+  termina com um schema diferente.
+- **Id por `SEQUENCE`, não `IDENTITY`.** `IDENTITY` obriga um `INSERT` por
+  `persist()` para ler a chave gerada, e o batch nunca se forma. O
+  `allocationSize` do `@SequenceGenerator` precisa bater com o `INCREMENT BY` da
+  migration — divergir dá violação de chave primária só sob concorrência.
+- **Sem chave estrangeira entre `invoices` e `orders`.** Os dois grupos de consumo
+  são independentes e não há ordem garantida entre eles: a fatura pode ser gravada
+  antes do pedido. Uma FK transformaria essa corrida normal em erro de
+  integridade. A integridade aqui é eventual, e o índice assume isso.
+- **Três classes para "pedido".** `NewOrderRequest` (corpo do POST), `Order`
+  (payload de `orders.v1`) e `OrderRecord` (linha da tabela) mudam por motivos
+  diferentes. Uma classe só faria uma anotação JPA vazar para o payload do Kafka.
+- **`open-in-view: false`.** Ligado, um getter lazy tocado pelo serializador
+  dispara `SELECT` em silêncio. Desligado, vira exceção no desenvolvimento em vez
+  de N+1 em produção.
+
+A leitura é eventualmente consistente por construção: um `GET` logo depois do
+`POST` pode devolver 404, porque o 202 significa "o Kafka aceitou", não "o
+consumidor já gravou".
+
 ### Contrato das mensagens
 O payload não carrega o nome da classe Java. O header `__TypeId__` leva um nome
 lógico (`order`, `invoice`) mapeado por `spring.json.type.mapping` dos dois lados,
@@ -168,22 +231,33 @@ container entra em laço infinito na mesma mensagem.
 
 ## Testes
 
-`make verify` sobe um broker Kafka real via Testcontainers (`@ServiceConnection`)
-e exercita os três caminhos que definem o projeto:
+`make verify` sobe um Kafka **e um Postgres** reais via Testcontainers
+(`@ServiceConnection`) e exercita os caminhos que definem o projeto:
 
 ```
-Tests run: 3, Failures: 0, Errors: 0, Skipped: 0
+Tests run: 5, Failures: 0, Errors: 0, Skipped: 0
 ```
 
-- pedido válido percorre o pipeline e vira fatura `committed`;
-- pedido acima do limite vai direto para a DLT, e os headers `kafka_dlt-*` trazem
-  a causa correta;
-- falha temporária se recupera no retry e **não** gera dead letter.
+- pedido válido percorre o pipeline, vira fatura `committed` e aparece nas duas
+  tabelas;
+- pedido acima do limite vai direto para a DLT com os headers `kafka_dlt-*`
+  corretos, e ainda assim é gravado — como `REJECTED`, sem fatura;
+- falha temporária se recupera no retry, **não** gera dead letter, e as três
+  tentativas viram uma linha só;
+- transação abortada: das 5 faturas escritas no log, 4 ficam invisíveis em
+  `read_committed` e a 5ª commita junto com a recuperação;
+- a API de leitura devolve o pedido com suas faturas, 404 para id ainda não
+  projetado e a agregação por cliente.
 
-Broker real em vez de mock por um motivo simples: transação, rebalance,
-`read_committed` e o comportamento da DLT não existem em mock. Os testes leem o
-payload como string crua — verificam o que chegou no tópico, não o que a própria
-aplicação conseguiria desserializar.
+Serviço real em vez de mock por um motivo simples: transação, rebalance,
+`read_committed` e o comportamento da DLT não existem em mock — e `TIMESTAMPTZ`,
+sequence e violação de constraint não se comportam igual em banco em memória. Um
+teste que passa contra H2 e falha contra Postgres testou o H2.
+
+Os testes leem o payload como string crua — verificam o que chegou no tópico, não
+o que a própria aplicação conseguiria desserializar. Os asserts de banco esperam
+com Awaitility: a gravação é assíncrona, e assert logo depois do 202 testaria a
+velocidade da máquina.
 
 ---
 
@@ -217,20 +291,40 @@ src/main/java/com/cyro/kafka/
 ├── order/
 │   ├── Order.java                     evento de orders.v1
 │   ├── NewOrderRequest.java           contrato HTTP, separado do evento
-│   ├── OrderRules.java                regras compartilhadas pelos dois grupos
+│   ├── OrderRules.java                regras compartilhadas pelos grupos
 │   ├── OrderPublisher.java            produtor
 │   └── OrderValidationListener.java   consumidor com retry e DLT
 ├── invoice/
 │   ├── Invoice.java
 │   ├── InvoiceProcessor.java          read-process-write transacional
 │   └── InvoiceAuditListener.java      prova o efeito do read_committed
+├── store/
+│   ├── OrderRecord.java               entidade JPA de orders (só inserção)
+│   ├── InvoiceRecord.java             entidade JPA de invoices
+│   ├── OrderStatus.java               enum gravado como texto, com CHECK
+│   ├── OrderRecordRepository.java     Spring Data + um JPQL de agregação
+│   ├── InvoiceRecordRepository.java
+│   ├── ReadModelStore.java            limite da transação e idempotência
+│   ├── OrderStoreListener.java        grupo order-store
+│   └── InvoiceStoreListener.java      grupo invoice-store
 ├── deadletter/
 │   └── DeadLetterListener.java        inspeção da DLT com ack manual
 └── web/
-    └── OrderController.java           API HTTP (responde 202, não 201)
+    ├── OrderController.java           escrita: publica e responde 202
+    ├── ReadModelController.java       leitura: consulta as projeções
+    ├── OrderView.java                 DTOs — a entidade não vira JSON
+    ├── InvoiceView.java
+    ├── OrderDetailView.java
+    └── CustomerSummaryView.java
+
+src/main/resources/
+├── application.yml                    Kafka, datasource, JPA e Flyway
+└── db/migration/
+    └── V1__pedidos_e_faturas.sql      tabelas, sequences, índices, constraints
 ```
 
 ## Stack
 
 Spring Boot 4.1.1 · Spring Kafka 4.1.1 · Apache Kafka 4.0 (KRaft) · Java 21 ·
-Jackson 3 · Testcontainers · Maven Wrapper
+Jackson 3 · Spring Data JPA · Hibernate 7.4 · PostgreSQL 17 · Flyway 12 ·
+Testcontainers · Maven Wrapper

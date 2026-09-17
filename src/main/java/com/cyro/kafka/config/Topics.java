@@ -31,6 +31,19 @@ public final class Topics {
 	/** Faturas emitidas pelo processador transacional. */
 	public static final String INVOICES = "invoices.v1";
 
+	/**
+	 * Dead letter das faturas.
+	 *
+	 * <p>Existe porque o {@code DefaultErrorHandler} é global: qualquer listener
+	 * que esgote as tentativas tem o registro republicado em
+	 * {@code <tópico>.DLT}. Enquanto ninguém falhava consumindo {@code invoices.v1}
+	 * o tópico nunca era usado — com o {@code InvoiceStoreListener} gravando no
+	 * Postgres, um banco fora do ar passa a ser um caminho real até aqui. E, com
+	 * {@code auto.create.topics.enable=false}, publicar em tópico inexistente não
+	 * dá erro: trava o produtor em {@code UNKNOWN_TOPIC_OR_PARTITION}.
+	 */
+	public static final String INVOICES_DLT = INVOICES + DLT_SUFFIX;
+
 	private Topics() {
 	}
 

@@ -1,6 +1,6 @@
 # ---------------------------------------------------------------------------
-# Toda a configuração de Kafka do projeto. Cada bloco tem um porquê — o
-# comentário acima de cada propriedade explica a escolha e o que ela custa.
+# Toda a configuração de Kafka e de banco do projeto. Cada bloco tem um porquê —
+# o comentário acima de cada propriedade explica a escolha e o que ela custa.
 # ---------------------------------------------------------------------------
 server:
   port: 8090   # 8080 já é usado pela UI do projeto irmão go-kafka
@@ -8,6 +8,58 @@ server:
 spring:
   application:
     name: java-spring-kafka
+
+  # -------------------------------------------------------------------------
+  # Banco: o read model do pipeline. Quem escreve são os consumidores Kafka
+  # (grupos order-store e invoice-store), não a API — o POST publica no tópico e
+  # responde 202. Ver a seção "Read model" no README.
+  # -------------------------------------------------------------------------
+  datasource:
+    # 35432 e não 5432: a porta do compose é deslocada para conviver com os
+    # outros Postgres desta máquina.
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:35432/orders}
+    username: ${SPRING_DATASOURCE_USERNAME:app}
+    password: ${SPRING_DATASOURCE_PASSWORD:app}
+    hikari:
+      # O pool precisa caber no orçamento de conexões do banco. Aqui são 3
+      # threads de listener por container mais o pool do MVC; 10 é folgado e
+      # ainda muito abaixo do max_connections padrão (100).
+      maximum-pool-size: 10
+      # Falha rápido em vez de pendurar a thread do listener esperando conexão.
+      # Timeout curto aparece como erro tratável; timeout longo aparece como
+      # rebalance, porque o consumidor perde o max.poll.interval.
+      connection-timeout: 5000
+
+  jpa:
+    # validate, nunca update: quem cria e altera tabela é o Flyway. Com `update`
+    # o Hibernate altera o schema sozinho no start — é confortável em
+    # desenvolvimento e destrutivo em produção (ele nunca remove nem renomeia,
+    # só acumula, e cada ambiente termina com um schema diferente).
+    hibernate:
+      ddl-auto: validate
+    # Desligado de propósito. Com open-in-view a sessão do Hibernate fica aberta
+    # até o fim da resposta HTTP, e um getter de coleção lazy no serializador
+    # dispara SELECT extra em silêncio. Desligado, esse acesso vira exceção no
+    # desenvolvimento em vez de N+1 em produção.
+    open-in-view: false
+    properties:
+      hibernate:
+        # O dialeto é detectado pelo driver; não é preciso declarar.
+        jdbc:
+          # Só tem efeito real com id gerado por SEQUENCE — IDENTITY força o
+          # Hibernate a ir ao banco a cada insert para saber a chave gerada, e
+          # o lote nunca se forma. Ver o comentário em OrderRecord.
+          batch_size: 30
+        order_inserts: true
+
+  flyway:
+    # Migrations em src/main/resources/db/migration, aplicadas no start antes de
+    # o Hibernate validar o schema. O Boot garante essa ordem.
+    enabled: true
+    # Nenhuma migration é reescrita depois de aplicada: o Flyway guarda o
+    # checksum em flyway_schema_history e recusa subir se o arquivo mudou. Uma
+    # correção é sempre uma migration nova.
+    validate-on-migrate: true
 
   kafka:
     # Lista de contato inicial. O cliente pergunta a metadata a qualquer um
@@ -98,3 +150,7 @@ logging:
     # Descomente para ver rebalance, commit de offset e atribuição de partição:
     # org.springframework.kafka.listener: DEBUG
     # org.apache.kafka.clients.consumer: DEBUG
+    # Descomente para ver o SQL gerado e os parâmetros ligados. Preferível a
+    # `spring.jpa.show-sql`, que escreve em System.out sem passar pelo logger:
+    # org.hibernate.SQL: DEBUG
+    # org.hibernate.orm.jdbc.bind: TRACE

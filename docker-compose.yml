@@ -1,7 +1,8 @@
-# Kafka em modo KRaft (sem Zookeeper), 1 broker.
+# Infra local: Kafka em modo KRaft (sem Zookeeper, 1 broker) e Postgres.
 #
-# Portas deslocadas de propósito (39092 em vez de 9092) para conviver com o
-# projeto go-kafka, que já ocupa 9092 e 29092-29094 nesta máquina.
+# Portas deslocadas de propósito (39092 em vez de 9092, 35432 em vez de 5432)
+# para conviver com o projeto go-kafka, que já ocupa 9092 e 29092-29094, e com o
+# Postgres do data-app-playnest-backend, que já ocupa 5433 nesta máquina.
 name: java-spring-kafka
 
 services:
@@ -45,6 +46,28 @@ services:
       retries: 20
       start_period: 10s
 
+  postgres:
+    image: postgres:17-alpine
+    ports:
+      - "35432:5432"
+    environment:
+      POSTGRES_DB: orders
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      # Credenciais fracas de propósito: é banco local descartável. Em qualquer
+      # ambiente compartilhado isto vira secret, não literal em YAML versionado.
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # `docker compose up -d --wait` só retorna quando isto passa. Sem
+      # healthcheck o `make run` pode subir a aplicação antes de o banco aceitar
+      # conexão, e o Flyway falha no start.
+      test: ["CMD-SHELL", "pg_isready -U app -d orders"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
   # UI opcional: `docker compose --profile ui up -d`
   kafka-ui:
     image: kafbat/kafka-ui:latest
@@ -58,3 +81,9 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+
+# Volume nomeado, e não bind mount: os dados ficam sob controle do Docker e são
+# apagados por `docker compose down -v` (o `make down`/`make reset`). Um bind
+# mount em ./data deixaria arquivos root-owned no repositório.
+volumes:
+  postgres-data:

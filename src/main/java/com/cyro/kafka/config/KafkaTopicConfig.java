@@ -57,4 +57,21 @@ public class KafkaTopicConfig {
 				.build();
 	}
 
+	/**
+	 * DLT das faturas — mesmo número de partições, mesma razão.
+	 *
+	 * <p>Só passou a ser alcançável quando o {@code InvoiceStoreListener} começou
+	 * a gravar no Postgres: até então nenhum consumidor de {@code invoices.v1}
+	 * podia falhar. Declarar um tópico que talvez nunca receba nada é barato;
+	 * descobrir que ele falta é caro, porque o sintoma é um produtor travado em
+	 * retry de metadata, sem exceção.
+	 */
+	@Bean
+	NewTopic invoicesDltTopic() {
+		return TopicBuilder.name(Topics.INVOICES_DLT)
+				.partitions(3)
+				.replicas(1)
+				.build();
+	}
+
 }
